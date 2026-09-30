@@ -56,15 +56,21 @@ jobs:
       - name: Build CLI
         run: cargo build --release --target ${{ matrix.target }} -p lfff-cli
 
-      # README promises a static binary, and Android 10+ refuses to exec
-      # anything that is not position-independent. Fail here rather than
-      # ship a build that breaks either.
-      - name: Check the binary is static-pie
+      # README promises a static binary, and a program interpreter is exactly
+      # what broke Termux (#13), so fail rather than ship one that has it.
+      # Static, not necessarily static-pie: rustc only builds static-pie where
+      # the target allows it (x86_64 musl does, aarch64 musl does not yet), and
+      # Android's PIE-only rule lives in its dynamic linker, which a static
+      # binary never goes through — the kernel runs it directly.
+      - name: Check the binary is static
         if: contains(matrix.target, 'linux')
         run: |
           bin=target/${{ matrix.target }}/release/lfff
           file "$bin"
-          file "$bin" | grep -q 'static-pie linked'
+          if readelf -l "$bin" | grep -q INTERP; then
+            echo "error: $bin needs a program interpreter, it is not static" >&2
+            exit 1
+          fi
 
       - name: Package
         run: |
