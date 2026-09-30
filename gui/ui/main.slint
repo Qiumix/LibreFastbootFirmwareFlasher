@@ -26,7 +26,9 @@ import { PartitionFinalDialog } from "dialogs/partition-final-dialog.slint";
 import { PostFlashSuccessDialog } from "dialogs/post-flash-success-dialog.slint";
 import { CableTestDialog } from "dialogs/cable-test-dialog.slint";
 import { FlashFailureDialog } from "dialogs/flash-failure-dialog.slint";
-import { ArbWarningDialog } from "dialogs/arb-warning-dialog.slint";
+import { ArbWarningDialog, ArbState } from "dialogs/arb-warning-dialog.slint";
+// Re-exported so the Rust side gets the generated ArbState type.
+export { ArbState }
 import { PreloaderWarningDialog } from "dialogs/preloader-warning-dialog.slint";
 import { UpdateDialog } from "dialogs/update-dialog.slint";
 import { WarningDialog } from "dialogs/all.slint";
@@ -228,6 +230,7 @@ export component MainWindow inherits MaterialWindow {
     // Extracted/validated firmware directory, set by the worker via FlashPrepared.
     in-out property <string>  prepared-dir: "";
     in-out property <bool>    show-arb-warning: false;
+    in-out property <ArbState> arb-warning-state: ArbState.known;
     in-out property <int>     arb-warning-version: 0;
     in-out property <bool>    skip-xbl-abl: false;
     in-out property <bool>    skip-preloader: false;
@@ -607,6 +610,7 @@ export component MainWindow inherits MaterialWindow {
     ArbWarningDialog {
         show: root.show-arb-warning;
         lang: root.lang;
+        arb-warning-state: root.arb-warning-state;
         arb-warning-version: root.arb-warning-version;
         skip-xbl-abl <=> root.skip-xbl-abl;
         cancel => { root.show-arb-warning = false; root.pending-source-flash = false; }

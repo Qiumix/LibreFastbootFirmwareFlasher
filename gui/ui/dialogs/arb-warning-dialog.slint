@@ -2,6 +2,10 @@ import { FilledButton, MaterialPalette, TextButton } from "@material";
 import { Tr } from "../globals/tr.slint";
 import { StatusColors } from "../globals/status-colors.slint";
 
+// Mirrors lfff_lib::arb::ArbVerdict. An unknown ARB is its own state rather
+// than a zero: zero means the counter will not rise, unknown means nothing.
+export enum ArbState { known, not-found, unparsed }
+
 export component ArbWarningDialog {
     // A dialog is a full-window overlay: without this the root sizes itself
     // to the card, and the scrim below covers only the card's own bounds
@@ -10,6 +14,8 @@ export component ArbWarningDialog {
     height: 100%;
     in property <bool> show;
     in property <string> lang: "en";
+    in property <ArbState> arb-warning-state: ArbState.known;
+    // Meaningful only when arb-warning-state is `known`.
     in property <int> arb-warning-version: 0;
     in-out property <bool> skip-xbl-abl: false;
 
@@ -42,7 +48,15 @@ export component ArbWarningDialog {
                     }
                 }
                 Text {
-                    text: root.arb-warning-version > 0
+                    text: root.arb-warning-state == ArbState.not-found
+                        ? (root.lang == "ru"
+                            ? "В этой прошивке не найден xbl_config.img, поэтому её версия ARB неизвестна. Это не то же самое, что ARB=0.\n\nЕсли ARB прошивки выше, чем у устройства, счётчик anti-rollback будет необратимо повышен; если ниже — устройство не загрузится.\n\nПродолжайте, только если знаете ARB этой прошивки из другого источника."
+                            : "No xbl_config.img was found in this firmware, so its ARB version is unknown. This is not the same as ARB=0.\n\nIf the firmware's ARB is higher than your device's, the anti-rollback counter will be permanently raised; if it is lower, the device will not boot.\n\nOnly continue if you know this firmware's ARB from another source.")
+                    : root.arb-warning-state == ArbState.unparsed
+                        ? (root.lang == "ru"
+                            ? "xbl_config.img найден, но прочитать его не удалось, поэтому версия ARB прошивки неизвестна. Это не то же самое, что ARB=0.\n\nЕсли ARB прошивки выше, чем у устройства, счётчик anti-rollback будет необратимо повышен; если ниже — устройство не загрузится.\n\nПродолжайте, только если знаете ARB этой прошивки из другого источника."
+                            : "xbl_config.img was found but could not be read, so the firmware's ARB version is unknown. This is not the same as ARB=0.\n\nIf the firmware's ARB is higher than your device's, the anti-rollback counter will be permanently raised; if it is lower, the device will not boot.\n\nOnly continue if you know this firmware's ARB from another source.")
+                    : root.arb-warning-version > 0
                         ? (root.lang == "ru"
                             ? "Прошивка содержит ARB=" + root.arb-warning-version + ".\n\nПосле прошивки счётчик anti-rollback на устройстве будет необратимо повышен. Вы НЕ сможете откатиться на прошивку с меньшим ARB — это приведёт к кирпичу.\n\nПродолжайте только если уверены, что не захотите сделать даунгрейд!"
                             : "Firmware has ARB=" + root.arb-warning-version + ".\n\nAfter flashing, the anti-rollback counter on your device will be permanently raised. You will NOT be able to downgrade to firmware with a lower ARB — this will brick your device.\n\nOnly continue if you are sure you will never need to downgrade!")

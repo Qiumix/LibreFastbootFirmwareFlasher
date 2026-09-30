@@ -4,7 +4,10 @@ use std::sync::mpsc;
 
 use crate::config::{get_output_dir, load_config, save_config, save_scale, set_output_dir};
 use crate::log_models::{LogModels, add_log_m};
-use crate::{Cmd, DeviceInfo, FlashMethod, LogEntry, LogLevel, MainWindow, WMsg, confirm_action};
+use crate::{
+    ArbState, Cmd, DeviceInfo, FlashMethod, LogEntry, LogLevel, MainWindow, WMsg, confirm_action,
+};
+use lfff_lib::arb::ArbVerdict;
 
 fn export_log(model: &VecModel<LogEntry>, tab_name: &str) -> Option<String> {
     use slint::Model;
@@ -227,7 +230,7 @@ pub fn poll(
             WMsg::FlashPrepared {
                 dir,
                 is_source,
-                arb_version,
+                arb,
                 has_preloader,
             } => {
                 ui.set_prepared_dir(dir.into());
@@ -236,17 +239,32 @@ pub fn poll(
                 // (MediaTek) FIRST, the final confirmation dialog AFTER.
                 let method = ui.get_flash_method(); // 1 = Snapdragon, 2 = MediaTek
                 if method == 1 && !is_source {
-                    add_log(
-                        models,
-                        &ui,
-                        &LogLevel::Warn,
-                        2,
-                        &format!(
-                            "ARB={} — flashing may permanently raise the anti-rollback counter. Confirm to continue.",
-                            arb_version
+                    // The worker always sends a verdict on this path; if it
+                    // somehow did not, warn as for an unknown ARB, never as zero.
+                    let (state, version, msg) = match arb.unwrap_or(ArbVerdict::Unparsed) {
+                        ArbVerdict::Known(v) => (
+                            ArbState::Known,
+                            v as i32,
+                            format!(
+                                "ARB={} — flashing may permanently raise the anti-rollback counter. Confirm to continue.",
+                                v
+                            ),
                         ),
-                    );
-                    ui.set_arb_warning_version(arb_version);
+                        ArbVerdict::NotFound => (
+                            ArbState::NotFound,
+                            0,
+                            "ARB unknown (xbl_config.img not found) — confirm to continue.".into(),
+                        ),
+                        ArbVerdict::Unparsed => (
+                            ArbState::Unparsed,
+                            0,
+                            "ARB unknown (xbl_config.img could not be parsed) — confirm to continue."
+                                .into(),
+                        ),
+                    };
+                    add_log(models, &ui, &LogLevel::Warn, 2, &msg);
+                    ui.set_arb_warning_state(state);
+                    ui.set_arb_warning_version(version);
                     ui.set_show_arb_warning(true);
                 } else if method == 2 && has_preloader {
                     add_log(

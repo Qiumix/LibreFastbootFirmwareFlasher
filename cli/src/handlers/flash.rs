@@ -3,6 +3,7 @@ use std::sync::atomic::AtomicBool;
 
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
+use lfff_lib::arb::ArbVerdict;
 use lfff_lib::flasher::{
     FastbootdStatus, FirmwareSource, FlashOptions, FlashProgress, collect_images,
     collect_images_from_source, fastbootd_status, is_preloader, is_xbl_abl,
@@ -44,39 +45,39 @@ fn arb_gate(dir: &std::path::Path) -> bool {
         "\n{}",
         "── ARB (Anti-Rollback) warning ──────────────────────────".dimmed()
     );
-    match lfff_lib::arb::find_xbl_config(dir) {
-        Some(xbl) => {
-            let arb = lfff_lib::arb::extract_arb_from_xbl(&xbl);
-            match arb.version {
-                Some(v) if v > 0 => {
-                    println!(
-                        "  {}",
-                        format!("Firmware ARB = {}. Flashing will permanently raise the anti-rollback counter.", v)
-                            .yellow()
-                    );
-                    println!("  {}", "You will NOT be able to downgrade to firmware with a lower ARB afterwards.".dimmed());
-                }
-                Some(_) => {
-                    println!(
-                        "  {}",
-                        "Firmware ARB = 0, but the device's current ARB level cannot be verified."
-                            .yellow()
-                    );
-                    println!(
-                        "  {}",
-                        "If the device already has ARB > 0, this firmware will not boot.".dimmed()
-                    );
-                }
-                None => {
-                    println!(
-                        "  {}",
-                        "Firmware ARB version is unknown (xbl_config could not be parsed)."
-                            .yellow()
-                    );
-                }
-            }
+    match lfff_lib::arb::firmware_arb(dir) {
+        ArbVerdict::Known(v) if v > 0 => {
+            println!(
+                "  {}",
+                format!(
+                    "Firmware ARB = {}. Flashing will permanently raise the anti-rollback counter.",
+                    v
+                )
+                .yellow()
+            );
+            println!(
+                "  {}",
+                "You will NOT be able to downgrade to firmware with a lower ARB afterwards."
+                    .dimmed()
+            );
         }
-        None => {
+        ArbVerdict::Known(_) => {
+            println!(
+                "  {}",
+                "Firmware ARB = 0, but the device's current ARB level cannot be verified.".yellow()
+            );
+            println!(
+                "  {}",
+                "If the device already has ARB > 0, this firmware will not boot.".dimmed()
+            );
+        }
+        ArbVerdict::Unparsed => {
+            println!(
+                "  {}",
+                "Firmware ARB version is unknown (xbl_config could not be parsed).".yellow()
+            );
+        }
+        ArbVerdict::NotFound => {
             println!(
                 "  {}",
                 "xbl_config.img not found — firmware ARB version is unknown.".yellow()

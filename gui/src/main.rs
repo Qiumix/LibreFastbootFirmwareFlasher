@@ -90,7 +90,8 @@ enum WMsg {
     FlashPrepared {
         dir: String,
         is_source: bool,
-        arb_version: i32,
+        /// `None` when no ARB warning applies (MediaTek, or a source build).
+        arb: Option<lfff_lib::arb::ArbVerdict>,
         has_preloader: bool,
     },
     ReadyToFlash,

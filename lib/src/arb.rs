@@ -211,6 +211,37 @@ pub fn extract_arb_from_xbl_config(path: &Path) -> ArbInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Verdict for a firmware directory
+// ---------------------------------------------------------------------------
+
+/// What is known about a firmware directory's ARB — the one answer every
+/// frontend bases its warning on.
+///
+/// "Could not tell" is kept apart from zero on purpose: zero means the
+/// anti-rollback counter will not rise, while an unknown means nothing at all,
+/// and presenting one as the other is how a user talks themselves into a brick.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArbVerdict {
+    /// Read from xbl_config's OEM metadata.
+    Known(u32),
+    /// There is no xbl_config.img anywhere under the directory.
+    NotFound,
+    /// xbl_config.img exists but could not be parsed.
+    Unparsed,
+}
+
+/// Decide the ARB of the firmware extracted into `dir`.
+pub fn firmware_arb(dir: &Path) -> ArbVerdict {
+    match find_xbl_config(dir) {
+        None => ArbVerdict::NotFound,
+        Some(xbl) => match extract_arb_from_xbl(&xbl).version {
+            Some(v) => ArbVerdict::Known(v),
+            None => ArbVerdict::Unparsed,
+        },
+    }
+}
+
+// ---------------------------------------------------------------------------
 // File locators
 // ---------------------------------------------------------------------------
 
@@ -286,5 +317,174 @@ mod tests {
             }
             .enforced()
         );
+    }
+
+    // A minimal xbl_config, built byte by byte in the layout the parser
+    // expects. It is laid out so that every step of the algorithm has to be
+    // right for the ARB to come out: like a real Qualcomm image it opens with
+    // a PT_NULL covering the headers, so only taking the *last* PT_NULL finds
+    // the hash segment; the table header sits behind zero padding the scanner
+    // has to step over; and the common and QTI blocks are non-empty, so the
+    // OEM offset arithmetic is actually exercised.
+
+    const PHENT: usize = 56;
+    const PT_LOAD: u32 = 1;
+    // Not a multiple of 8, so only the scanner's real 4-byte stride lands on it.
+    const PADDING: usize = 12;
+
+    struct Synth {
+        arb: u32,
+        common_sz: u32,
+        qti_sz: u32,
+    }
+
+    impl Default for Synth {
+        fn default() -> Self {
+            Self {
+                arb: 3,
+                common_sz: 0x40,
+                qti_sz: 0x80,
+            }
+        }
+    }
+
+    fn hash_segment(s: &Synth) -> Vec<u8> {
+        let mut seg = vec![0u8; PADDING];
+        let header = seg.len();
+        seg.extend(3u32.to_le_bytes()); // version
+        seg.extend(s.common_sz.to_le_bytes());
+        seg.extend(s.qti_sz.to_le_bytes());
+        seg.extend(12u32.to_le_bytes()); // oem_sz: major + minor + arb
+        seg.extend(0u32.to_le_bytes()); // hash_tbl_sz
+        seg.resize(header + 36, 0);
+        seg.resize(seg.len() + (s.common_sz + s.qti_sz) as usize, 0xAA);
+        seg.extend(7u32.to_le_bytes()); // oem major
+        seg.extend(9u32.to_le_bytes()); // oem minor
+        seg.extend(s.arb.to_le_bytes());
+        seg
+    }
+
+    fn elf_with(seg: &[u8]) -> Vec<u8> {
+        let phoff = 64;
+        let seg_off = phoff + 2 * PHENT;
+        let mut data = vec![0u8; seg_off];
+        data[..4].copy_from_slice(&ELF_MAGIC);
+        data[EI_CLASS] = ELFCLASS64;
+        data[0x20..0x28].copy_from_slice(&(phoff as u64).to_le_bytes());
+        data[0x36..0x38].copy_from_slice(&(PHENT as u16).to_le_bytes());
+        data[0x38..0x3A].copy_from_slice(&2u16.to_le_bytes());
+
+        // Decoy: a PT_NULL over the ELF header, which holds no hash table.
+        let decoy = phoff;
+        data[decoy..decoy + 4].copy_from_slice(&PT_NULL.to_le_bytes());
+        data[decoy + 32..decoy + 40].copy_from_slice(&(phoff as u64).to_le_bytes());
+
+        let null = phoff + PHENT;
+        data[null..null + 4].copy_from_slice(&PT_NULL.to_le_bytes());
+        data[null + 8..null + 16].copy_from_slice(&(seg_off as u64).to_le_bytes());
+        data[null + 32..null + 40].copy_from_slice(&(seg.len() as u64).to_le_bytes());
+
+        data.extend_from_slice(seg);
+        data
+    }
+
+    fn parse(bytes: &[u8]) -> ArbInfo {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("xbl_config.img");
+        std::fs::write(&path, bytes).expect("write synthetic image");
+        extract_arb_from_xbl_config(&path)
+    }
+
+    #[test]
+    fn reads_arb_and_oem_version_from_a_synthetic_image() {
+        let info = parse(&elf_with(&hash_segment(&Synth::default())));
+        assert_eq!(info.version, Some(3));
+        assert_eq!(info.oem_major, Some(7));
+        assert_eq!(info.oem_minor, Some(9));
+        assert!(info.enforced());
+    }
+
+    #[test]
+    fn arb_zero_is_a_known_value_not_an_unknown_one() {
+        let info = parse(&elf_with(&hash_segment(&Synth {
+            arb: 0,
+            ..Synth::default()
+        })));
+        assert_eq!(info.version, Some(0));
+        assert!(!info.enforced());
+    }
+
+    #[test]
+    fn oem_offset_follows_the_common_and_qti_sizes() {
+        for (common_sz, qti_sz) in [(0, 0), (0x10, 0), (0, 0x10), (0x200, 0x300)] {
+            let info = parse(&elf_with(&hash_segment(&Synth {
+                arb: 5,
+                common_sz,
+                qti_sz,
+            })));
+            assert_eq!(
+                info.version,
+                Some(5),
+                "common={common_sz:#x} qti={qti_sz:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn damaged_images_are_unknown_rather_than_zero() {
+        let good = elf_with(&hash_segment(&Synth::default()));
+
+        let truncated = &good[..good.len() - 6]; // cut through the ARB word
+        let mut elf32 = good.clone();
+        elf32[EI_CLASS] = 1;
+        let mut no_null = good.clone();
+        for ph in [64, 64 + PHENT] {
+            no_null[ph..ph + 4].copy_from_slice(&PT_LOAD.to_le_bytes());
+        }
+        let mut no_header = good.clone();
+        let seg_start = 64 + 2 * PHENT;
+        no_header[seg_start..].fill(0);
+
+        for (what, bytes) in [
+            ("truncated", truncated),
+            ("not ELF", &b"definitely not an ELF image, just text"[..]),
+            ("too small", &good[..32]),
+            ("ELF32", &elf32[..]),
+            ("no PT_NULL segment", &no_null[..]),
+            ("no hash table header", &no_header[..]),
+        ] {
+            assert_eq!(parse(bytes).version, None, "{what}");
+        }
+    }
+
+    #[test]
+    fn verdict_separates_zero_from_both_kinds_of_unknown() {
+        let dir = |bytes: Option<&[u8]>| {
+            let d = tempfile::tempdir().expect("tempdir");
+            if let Some(b) = bytes {
+                std::fs::write(d.path().join("xbl_config.img"), b).expect("write");
+            }
+            d
+        };
+        let zero = elf_with(&hash_segment(&Synth {
+            arb: 0,
+            ..Synth::default()
+        }));
+        let three = elf_with(&hash_segment(&Synth::default()));
+
+        assert_eq!(firmware_arb(dir(Some(&zero)).path()), ArbVerdict::Known(0));
+        assert_eq!(firmware_arb(dir(Some(&three)).path()), ArbVerdict::Known(3));
+        assert_eq!(firmware_arb(dir(None).path()), ArbVerdict::NotFound);
+        assert_eq!(
+            firmware_arb(dir(Some(b"not an elf")).path()),
+            ArbVerdict::Unparsed
+        );
+    }
+
+    #[test]
+    fn a_missing_file_is_unknown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let info = extract_arb_from_xbl_config(&dir.path().join("xbl_config.img"));
+        assert_eq!(info.version, None);
     }
 }

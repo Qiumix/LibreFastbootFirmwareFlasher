@@ -3,6 +3,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
+use lfff_lib::arb::ArbVerdict;
+
 use super::{Cmd, FlashMethod, LogLevel, WMsg};
 
 fn log(tx: &mpsc::Sender<WMsg>, l: LogLevel, tab: u8, m: impl Into<String>) {
@@ -781,38 +783,26 @@ pub fn worker(
 
                 // Snapdragon firmware: read the ARB version so the GUI can
                 // show the mandatory ARB warning before the final confirm.
-                let arb_version: i32 = if method == FlashMethod::Snapdragon && !is_source {
-                    match lfff_lib::arb::find_xbl_config(&dir) {
-                        Some(xbl) => {
-                            let a = lfff_lib::arb::extract_arb_from_xbl(&xbl);
-                            let v = a.version.map(|v| v as i32).unwrap_or(0);
-                            log(
-                                &tx,
-                                LogLevel::Warn,
-                                2,
-                                format!("Firmware ARB={} — waiting for user confirmation...", v),
-                            );
-                            v
+                let arb = if method == FlashMethod::Snapdragon && !is_source {
+                    let verdict = lfff_lib::arb::firmware_arb(&dir);
+                    let msg = match verdict {
+                        ArbVerdict::Known(v) => {
+                            format!("Firmware ARB={} — waiting for user confirmation...", v)
                         }
-                        None => {
-                            log(
-                                &tx,
-                                LogLevel::Warn,
-                                2,
-                                "xbl_config.img not found — firmware ARB version unknown, waiting for user confirmation...",
-                            );
-                            0
-                        }
-                    }
+                        ArbVerdict::NotFound => "xbl_config.img not found — firmware ARB version unknown, waiting for user confirmation...".into(),
+                        ArbVerdict::Unparsed => "xbl_config.img could not be parsed — firmware ARB version unknown, waiting for user confirmation...".into(),
+                    };
+                    log(&tx, LogLevel::Warn, 2, msg);
+                    Some(verdict)
                 } else {
-                    0
+                    None
                 };
 
                 tx.send(WMsg::Flashing(false)).ok();
                 tx.send(WMsg::FlashPrepared {
                     dir: dir.display().to_string(),
                     is_source,
-                    arb_version,
+                    arb,
                     has_preloader,
                 })
                 .ok();
