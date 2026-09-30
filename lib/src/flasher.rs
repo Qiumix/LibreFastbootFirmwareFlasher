@@ -312,7 +312,17 @@ pub fn get_active_slot(serial: Option<&str>) -> Option<String> {
     args.extend(&["getvar", "current-slot"]);
 
     let (_, out, err) = fastboot_cmd(&args, 10);
-    let combined = format!("{}\n{}", out, err).to_lowercase();
+    let slot = parse_current_slot(&format!("{}\n{}", out, err));
+    if slot.is_none() {
+        warn!("Could not detect active slot");
+    }
+    slot
+}
+
+/// Pull the active slot out of `fastboot getvar current-slot` output. Only a
+/// bare `a` or `b` is accepted; anything else is `None`, so the caller aborts.
+fn parse_current_slot(output: &str) -> Option<String> {
+    let combined = output.to_lowercase();
     for line in combined.lines() {
         if line.contains("current-slot:") {
             let slot = line.split("current-slot:").last().unwrap_or("").trim();
@@ -321,7 +331,6 @@ pub fn get_active_slot(serial: Option<&str>) -> Option<String> {
             }
         }
     }
-    warn!("Could not detect active slot");
     None
 }
 
@@ -1434,4 +1443,190 @@ pub fn run_flash_session_with_log(
 
     session.end_reason = Some("Completed".into());
     session
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn images(names: &[&str]) -> HashMap<String, PathBuf> {
+        names
+            .iter()
+            .map(|n| (n.to_string(), PathBuf::from(format!("{n}.img"))))
+            .collect()
+    }
+
+    // The routing predicates match exactly and case-sensitively: callers pass
+    // names that collect_images has already lowercased and stripped of their
+    // slot suffix. These pin that contract, so a caller that skips the
+    // normalisation shows up here instead of on a device.
+
+    #[test]
+    fn super_partitions_are_matched_exactly() {
+        for name in [
+            "system",
+            "system_ext",
+            "vendor",
+            "product",
+            "odm",
+            "my_product",
+        ] {
+            assert!(is_super_partition(name), "{name} should be dynamic");
+        }
+        for name in ["System", "system_a", "super", "boot", "modem", ""] {
+            assert!(!is_super_partition(name), "{name} should not be dynamic");
+        }
+    }
+
+    #[test]
+    fn critical_partitions_are_matched_exactly() {
+        for name in [
+            "abl",
+            "xbl",
+            "xbl_config",
+            "boot",
+            "init_boot",
+            "modem",
+            "tz",
+        ] {
+            assert!(is_critical_partition(name), "{name} should be critical");
+        }
+        for name in ["system", "XBL", "xbl_a", "recovery", ""] {
+            assert!(
+                !is_critical_partition(name),
+                "{name} should not be critical"
+            );
+        }
+    }
+
+    #[test]
+    fn only_modem_goes_through_the_bootloader() {
+        assert!(is_bootloader_partition("modem"));
+        for name in ["modem_a", "Modem", "boot", "xbl", ""] {
+            assert!(!is_bootloader_partition(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn xbl_abl_is_a_case_insensitive_prefix_match() {
+        for name in [
+            "xbl",
+            "xbl_config",
+            "XBL_CONFIG",
+            "abl",
+            "ABL_a",
+            "xbl_ramdump",
+        ] {
+            assert!(is_xbl_abl(name), "{name}");
+        }
+        // Shorter than the prefix, or merely containing it later, is not a match.
+        for name in ["", "xb", "ab", "system", "my_xbl"] {
+            assert!(!is_xbl_abl(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn preloader_is_a_case_insensitive_prefix_match() {
+        for name in ["preloader", "PRELOADER", "preloader_raw", "preloader_a"] {
+            assert!(is_preloader(name), "{name}");
+        }
+        for name in ["", "pre", "loader", "my_preloader"] {
+            assert!(!is_preloader(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn prefix_check_never_panics_on_short_or_non_ascii_input() {
+        assert!(starts_with_ignore_ascii_case("anything", ""));
+        assert!(!starts_with_ignore_ascii_case("x", "xbl"));
+        // The comparison is on bytes, so a prefix that ends mid-codepoint is
+        // simply a mismatch rather than a slicing panic.
+        assert!(!starts_with_ignore_ascii_case("жbl", "xbl"));
+        assert!(!starts_with_ignore_ascii_case("ж", "xb"));
+    }
+
+    #[test]
+    fn mediatek_means_preloader_and_no_xbl() {
+        assert!(is_mediatek_build(&images(&["preloader", "boot", "super"])));
+        assert!(is_mediatek_build(&images(&["preloader_raw", "lk"])));
+
+        // Qualcomm images always carry xbl or xbl_config.
+        assert!(!is_mediatek_build(&images(&["preloader", "xbl"])));
+        assert!(!is_mediatek_build(&images(&["preloader", "XBL.img"])));
+        assert!(!is_mediatek_build(&images(&["preloader", "xbl_config"])));
+        assert!(!is_mediatek_build(&images(&["preloader", "xbl_config_a"])));
+
+        // No preloader at all is never MediaTek, xbl or not.
+        assert!(!is_mediatek_build(&images(&["boot", "system"])));
+        assert!(!is_mediatek_build(&images(&[])));
+    }
+
+    // get_active_slot's docstring: flashing dynamic partitions to the wrong
+    // slot leaves the device unbootable, so anything but a clean `a` or `b`
+    // must come back as None and make the caller abort.
+
+    #[test]
+    fn current_slot_is_read_from_real_fastboot_output() {
+        let stderr = "current-slot: a\nFinished. Total time: 0.001s\n";
+        assert_eq!(parse_current_slot(stderr).as_deref(), Some("a"));
+        assert_eq!(
+            parse_current_slot("(bootloader) current-slot: b").as_deref(),
+            Some("b")
+        );
+        assert_eq!(parse_current_slot("Current-Slot: A").as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn current_slot_refuses_to_guess() {
+        for output in [
+            "",
+            "current-slot:",
+            "current-slot: c",
+            // Some bootloaders answer with the suffix form. Accepting it is a
+            // deliberate decision for another day; today it must not slip
+            // through as something else.
+            "current-slot: _a",
+            "getvar:current-slot FAILED (remote: 'unknown variable')",
+            "Finished. Total time: 0.001s",
+        ] {
+            assert_eq!(parse_current_slot(output), None, "{output:?}");
+        }
+    }
+
+    #[test]
+    fn getvar_matches_the_key_exactly() {
+        assert_eq!(
+            parse_fastboot_getvar("is-userspace: yes\nFinished.", "is-userspace").as_deref(),
+            Some("yes")
+        );
+        assert_eq!(
+            parse_fastboot_getvar("(bootloader) is-userspace: no", "is-userspace").as_deref(),
+            Some("no")
+        );
+        // A key that is only a suffix of the real one must not match it.
+        assert_eq!(
+            parse_fastboot_getvar("is-userspace: yes", "userspace"),
+            None
+        );
+        // Only the first colon separates key from value.
+        assert_eq!(
+            parse_fastboot_getvar("version-bootloader: 1.2:3", "version-bootloader").as_deref(),
+            Some("1.2:3")
+        );
+    }
+
+    #[test]
+    fn getvar_failures_are_none() {
+        for output in [
+            "",
+            "getvar:is-userspace FAILED (remote: 'unknown variable')",
+            "Finished. Total time: 0.001s",
+        ] {
+            assert_eq!(
+                parse_fastboot_getvar(output, "is-userspace"),
+                None,
+                "{output:?}"
+            );
+        }
+    }
 }
