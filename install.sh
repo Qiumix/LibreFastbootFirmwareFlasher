@@ -65,6 +65,19 @@ detect_platform() {
 }
 
 # Find best install directory
+# Termux runs on Android's Bionic libc rather than glibc, yet uname reports a
+# plain "Linux" there, so it needs its own check. The CLI is a static binary
+# and runs fine; the GUI has no display server to talk to.
+is_termux() {
+    [ -n "${TERMUX_VERSION:-}" ] || [ "$(uname -o 2>/dev/null)" = "Android" ]
+}
+
+# musl distributions (Void, Alpine) cannot run the glibc build of the GUI and
+# get a separate musl one. The CLI is static, so it is the same everywhere.
+is_musl() {
+    [ -e "/lib/ld-musl-$(uname -m).so.1" ] || ldd --version 2>&1 | grep -qi musl
+}
+
 find_install_dir() {
     if [ -w /usr/local/bin ]; then
         echo "/usr/local/bin"
@@ -139,9 +152,9 @@ install_binary() {
 
     info "Downloading $asset_name..."
     if command -v curl &>/dev/null; then
-        curl -fsSL "$url" -o "$tmp/$asset_name"
+        curl -fsSL "$url" -o "$tmp/$asset_name" || err "Could not download $url"
     else
-        wget -qO "$tmp/$asset_name" "$url"
+        wget -qO "$tmp/$asset_name" "$url" || err "Could not download $url"
     fi
     ok "Downloaded"
 
@@ -224,6 +237,21 @@ main() {
     platform="$(detect_platform)"
     info "Platform: $platform"
 
+    local gui_asset="lfff-gui-${platform}.tar.gz"
+    local termux=false
+    if is_termux; then
+        termux=true
+        info "Termux detected"
+        if $INSTALL_GUI; then
+            $INSTALL_CLI || err "The GUI does not run on Android: Termux has no display server. Install the CLI instead (--cli-only)."
+            warn "Skipping the GUI: it does not run on Android. Installing the CLI only."
+            INSTALL_GUI=false
+        fi
+    elif [ "${platform%%-*}" = "linux" ] && is_musl; then
+        info "musl libc detected — using the musl build of the GUI"
+        gui_asset="lfff-gui-${platform}-musl.tar.gz"
+    fi
+
     if [ -z "$VERSION" ]; then
         info "Fetching latest release..."
         VERSION="$(get_latest_version)"
@@ -239,7 +267,7 @@ main() {
     fi
 
     if $INSTALL_GUI; then
-        install_binary "lfff-gui" "lfff-gui-${platform}.tar.gz" "$VERSION" "$install_dir"
+        install_binary "lfff-gui" "$gui_asset" "$VERSION" "$install_dir"
 
         # Install .desktop entry and icon on Linux
         if [ "$(uname -s)" = "Linux" ]; then
@@ -280,7 +308,12 @@ main() {
 
     echo
     if $INSTALL_CLI && command -v lfff &>/dev/null; then
-        ok "lfff is ready! Run ${BOLD}lfff deps${NC} to install external tools."
+        if $termux; then
+            # lfff deps does not know Termux's packages; point at them directly.
+            ok "lfff is ready! Install fastboot and adb with: ${BOLD}pkg install android-tools${NC}"
+        else
+            ok "lfff is ready! Run ${BOLD}lfff deps${NC} to install external tools."
+        fi
     fi
     if $INSTALL_GUI && command -v lfff-gui &>/dev/null; then
         ok "lfff-gui is ready!"

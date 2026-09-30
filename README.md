@@ -9,7 +9,8 @@
 [![Releases](https://img.shields.io/github/v/release/mrFrok/LibreFastbootFirmwareFlasher)](https://github.com/mrFrok/LibreFastbootFirmwareFlasher/releases)
 
 **Free, open-source firmware flasher for Android A/B devices via fastboot.**  
-CLI + GUI — single static binary, no Python, no bloat. Built with [Slint](https://slint.dev).
+CLI + GUI — no Python, no bloat. The CLI is a single static binary that runs on any Linux,
+Termux included. Built with [Slint](https://slint.dev).
 
 [Installation](#installation) · [Quick Start](#quick-start) · [CLI Commands](#cli-commands) · [Tested Devices](#tested-devices) · [Development](#development)
 
@@ -41,7 +42,17 @@ curl -fsSL https://raw.githubusercontent.com/mrFrok/LibreFastbootFirmwareFlasher
 # Flags: --cli-only | --gui-only | --uninstall
 ```
 
-Installs to `~/.local/bin` — works on **all** Linux distros including atomic/immutable (Fedora Silverblue, Bazzite, NixOS, SteamOS) and macOS.
+Installs to `~/.local/bin` — works on **all** Linux distros including atomic/immutable (Fedora Silverblue, Bazzite, NixOS, SteamOS), musl-based ones (Void, Alpine) and macOS.
+
+**musl distributions (Void, Alpine)** — the installer detects musl and picks the
+matching GUI build (`lfff-gui-linux-<arch>-musl.tar.gz`). The CLI is static and
+the same everywhere.
+
+**Termux (Android)** — the CLI only; there is no display server for the GUI.
+```bash
+curl -fsSL https://raw.githubusercontent.com/mrFrok/LibreFastbootFirmwareFlasher/main/install.sh | bash -s -- --cli-only
+pkg install android-tools    # fastboot and adb
+```
 
 **Arch Linux (AUR)**
 ```bash
