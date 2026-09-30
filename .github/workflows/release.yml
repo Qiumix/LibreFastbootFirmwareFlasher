@@ -22,10 +22,13 @@ jobs:
     strategy:
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          # musl, not gnu: a static binary runs on any Linux — glibc distros,
+          # musl ones like Void and Alpine, and Termux on Android, which has
+          # neither. The asset names stay the same, so nothing downstream moves.
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
             name: linux-x86_64
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             os: ubuntu-24.04-arm
             name: linux-aarch64
           - target: x86_64-apple-darwin
@@ -52,6 +55,16 @@ jobs:
 
       - name: Build CLI
         run: cargo build --release --target ${{ matrix.target }} -p lfff-cli
+
+      # README promises a static binary, and Android 10+ refuses to exec
+      # anything that is not position-independent. Fail here rather than
+      # ship a build that breaks either.
+      - name: Check the binary is static-pie
+        if: contains(matrix.target, 'linux')
+        run: |
+          bin=target/${{ matrix.target }}/release/lfff
+          file "$bin"
+          file "$bin" | grep -q 'static-pie linked'
 
       - name: Package
         run: |
@@ -161,6 +174,49 @@ jobs:
           path: dist/lfff-gui-${{ matrix.name }}.tar.gz*
 
 
+  # GUI for musl distributions (Void, Alpine) — a dynamically linked musl
+  # build alongside the glibc one, since each only runs on its own libc.
+  # scripts/build-gui-musl.sh explains why it is dynamic and built in Alpine.
+  #
+  # The build runs through `docker run` rather than `container:` because
+  # JavaScript actions (checkout, upload-artifact) do not run inside Alpine
+  # containers on arm64 runners. It also means the exact same script is what
+  # gets tested locally.
+  build-gui-musl:
+    name: GUI musl — ${{ matrix.arch }}
+    if: github.event_name == 'push'
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build GUI in Alpine
+        run: |
+          docker run --rm -v "$PWD":/src -w /src rust:alpine \
+            scripts/build-gui-musl.sh "$(id -u):$(id -g)"
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/musl/release/lfff-gui dist/
+          cd dist
+          tar czf lfff-gui-linux-${{ matrix.arch }}-musl.tar.gz lfff-gui
+          sha256sum lfff-gui-linux-${{ matrix.arch }}-musl.tar.gz \
+            > lfff-gui-linux-${{ matrix.arch }}-musl.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-musl-${{ matrix.arch }}
+          path: dist/lfff-gui-linux-${{ matrix.arch }}-musl.tar.gz*
+
   package-appimage:
     name: AppImage — ${{ matrix.arch }}
     needs: [build-cli, build-gui]
@@ -233,7 +289,7 @@ jobs:
           path: dist/lfff-gui-linux-${{ matrix.arch }}.AppImage*
 
   release:
-    needs: [build-cli, build-gui, package-appimage]
+    needs: [build-cli, build-gui, build-gui-musl, package-appimage]
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     permissions:
