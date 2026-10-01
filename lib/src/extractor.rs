@@ -118,6 +118,46 @@ fn parse_payload_properties(data: &str) -> HashMap<String, String> {
         .collect()
 }
 
+/// Left in every directory LFFF extracts into, so a later extraction knows it
+/// may clean up after the earlier one there — and leaves alone any directory
+/// it did not create, since the CLI lets the user pick any output path.
+const EXTRACTION_MARKER: &str = ".lfff-extracted";
+
+/// Before extracting into `dir` again, drop the `.img` files a previous LFFF
+/// extraction left in its own group folders. Flashing collects every image
+/// under the directory, so a leftover — say a `persist.img` from an earlier,
+/// untrusted archive — would otherwise be flashed alongside the new firmware.
+///
+/// Only acts on directories carrying [`EXTRACTION_MARKER`], and only on `.img`
+/// files directly inside LFFF's own group folders; nothing else is touched.
+fn clear_previous_extraction(dir: &Path) -> io::Result<()> {
+    if !dir.join(EXTRACTION_MARKER).is_file() {
+        return Ok(());
+    }
+    let groups = PARTITION_GROUPS
+        .iter()
+        .map(|(g, _)| *g)
+        .chain(["other", "_staging"]);
+    for group in groups {
+        let Ok(entries) = fs::read_dir(dir.join(group)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_img = path
+                .extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("img"));
+            // symlink_metadata: a symlink named *.img is removed as a link,
+            // never followed.
+            let is_file = fs::symlink_metadata(&path).is_ok_and(|m| !m.is_dir());
+            if is_img && is_file {
+                fs::remove_file(&path)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn move_into_groups(images: &[PathBuf], base: &Path) -> Result<HashMap<String, Vec<PathBuf>>> {
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for img in images {
@@ -407,6 +447,14 @@ pub fn extract_firmware_with_log(
     }
 
     fs::create_dir_all(output_dir).ok();
+    if let Err(e) = clear_previous_extraction(output_dir) {
+        return ExtractionResult::fail(
+            output_dir,
+            &format!("Cannot clear images from a previous extraction: {}", e),
+        );
+    }
+    // Written before extracting, so even a failed run is cleaned up next time.
+    fs::write(output_dir.join(EXTRACTION_MARKER), b"").ok();
     info!(
         "Extracting {} → {}",
         zip_path.file_name().unwrap_or_default().to_string_lossy(),
@@ -641,7 +689,42 @@ pub fn extract_firmware_with_log(
 ///    of `version_name`, e.g. `RMX3709TR` + `16.0.2.400` → `RMX3709TR_16.0.2.400`
 /// 2. `payload_properties.txt` — `ota_target_version` or `oplus_rom_version`
 /// 3. Fallback: ZIP file stem as before.
+///
+/// The result is always a single safe directory name: every caller joins it
+/// onto an output root, and the first two strategies read it from inside an
+/// archive the user downloaded — `product_name=../../x` must not escape.
 pub fn get_firmware_name(zip_path: &Path) -> String {
+    let stem = zip_path.file_stem().unwrap_or_default().to_string_lossy();
+    safe_dir_name(&firmware_name_from_archive(zip_path))
+        .or_else(|| safe_dir_name(&stem))
+        .unwrap_or_else(|| "firmware".to_string())
+}
+
+/// Reduce `raw` to a name that stays one directory deep: only ASCII letters,
+/// digits, `.`, `_` and `-` survive, everything else (separators included)
+/// becomes `_`, and leading dots are dropped so `..` and hidden names cannot
+/// come out. `None` if nothing usable is left.
+fn safe_dir_name(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let cleaned = cleaned.trim_start_matches('.');
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '_') {
+        None
+    } else {
+        Some(cleaned.to_string())
+    }
+}
+
+fn firmware_name_from_archive(zip_path: &Path) -> String {
     let fallback = || {
         zip_path
             .file_stem()
@@ -733,5 +816,173 @@ mod tests {
         let p = parse_payload_properties("FILE_HASH=abc\n# comment\nFILE_SIZE=123");
         assert_eq!(p.get("FILE_HASH"), Some(&"abc".to_string()));
         assert!(!p.contains_key("# comment"));
+    }
+
+    #[test]
+    fn safe_dir_name_keeps_ordinary_firmware_names() {
+        for name in [
+            "RMX3709_16.0.2.400",
+            "RMX3709TR",
+            "OnePlus-11_A.15",
+            "fw.v2",
+        ] {
+            assert_eq!(safe_dir_name(name).as_deref(), Some(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn safe_dir_name_never_leaves_one_directory() {
+        for (raw, want) in [
+            ("../../x", Some("_.._x")),
+            ("/home/victim/x", Some("_home_victim_x")),
+            ("a/b\\c", Some("a_b_c")),
+            ("..", None),
+            (".", None),
+            ("...hidden", Some("hidden")),
+            ("  ", None),
+            ("", None),
+            ("///", None),
+            ("16.0.2.400(EX01)", Some("16.0.2.400_EX01_")),
+            ("имя", None),
+        ] {
+            let got = safe_dir_name(raw);
+            assert_eq!(got.as_deref(), want, "{raw:?}");
+            if let Some(g) = got {
+                assert!(!g.contains('/') && !g.contains('\\') && !g.starts_with('.'));
+            }
+        }
+    }
+
+    fn touch(path: &Path) {
+        fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        fs::write(path, b"x").expect("write");
+    }
+
+    #[test]
+    fn a_previous_lfff_extraction_is_cleared_of_its_images_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+        touch(&d.join(EXTRACTION_MARKER));
+        touch(&d.join("other/persist.img"));
+        touch(&d.join("critical/XBL.IMG"));
+        touch(&d.join("_staging/boot.img"));
+        // Not LFFF's to remove: other file types, nested folders, the root.
+        touch(&d.join("other/notes.txt"));
+        touch(&d.join("other/keep/deep.img"));
+        touch(&d.join("mine.img"));
+        touch(&d.join("custom/user.img"));
+
+        clear_previous_extraction(d).expect("clear");
+
+        for gone in ["other/persist.img", "critical/XBL.IMG", "_staging/boot.img"] {
+            assert!(!d.join(gone).exists(), "{gone} should be removed");
+        }
+        for kept in [
+            "other/notes.txt",
+            "other/keep/deep.img",
+            "mine.img",
+            "custom/user.img",
+        ] {
+            assert!(d.join(kept).exists(), "{kept} should be kept");
+        }
+    }
+
+    #[test]
+    fn a_directory_lfff_did_not_create_is_never_touched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+        touch(&d.join("system/system.img"));
+        touch(&d.join("other/whatever.img"));
+
+        clear_previous_extraction(d).expect("clear");
+
+        assert!(d.join("system/system.img").exists());
+        assert!(d.join("other/whatever.img").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlinked_image_is_removed_as_a_link_not_followed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let outside = tempfile::tempdir().expect("tempdir");
+        let d = dir.path();
+        let target = outside.path().join("precious.img");
+        touch(&target);
+        touch(&d.join(EXTRACTION_MARKER));
+        fs::create_dir_all(d.join("other")).expect("mkdir");
+        std::os::unix::fs::symlink(&target, d.join("other/link.img")).expect("symlink");
+
+        clear_previous_extraction(d).expect("clear");
+
+        assert!(!d.join("other/link.img").exists());
+        assert!(target.exists(), "the link's target must survive");
+    }
+
+    fn zip_with(dir: &Path, name: &str, files: &[(&str, &str)]) -> PathBuf {
+        use std::io::Write;
+        let path = dir.join(name);
+        let mut w = zip::ZipWriter::new(fs::File::create(&path).expect("create zip"));
+        for (entry, body) in files {
+            w.start_file(*entry, zip::write::SimpleFileOptions::default())
+                .expect("start entry");
+            w.write_all(body.as_bytes()).expect("write entry");
+        }
+        w.finish().expect("finish zip");
+        path
+    }
+
+    #[test]
+    fn firmware_name_from_hostile_metadata_stays_inside_the_output_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = Path::new("/out");
+        for (meta, label) in [
+            (
+                "product_name=../../escape\nversion_name=X_1.0\n",
+                "relative",
+            ),
+            ("product_name=/etc/evil\nversion_name=\n", "absolute"),
+            ("product_name=..\nversion_name=\n", "dotdot"),
+        ] {
+            let zip = zip_with(
+                dir.path(),
+                &format!("{label}.zip"),
+                &[("META-INF/com/android/metadata", meta)],
+            );
+            let name = get_firmware_name(&zip);
+            let joined = root.join(&name);
+            assert_eq!(joined.parent(), Some(root), "{label}: {name:?}");
+            assert!(
+                joined.components().all(|c| matches!(
+                    c,
+                    std::path::Component::RootDir | std::path::Component::Normal(_)
+                )),
+                "{label}: {name:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn firmware_name_reads_real_metadata_and_payload_properties() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let meta = zip_with(
+            dir.path(),
+            "a.zip",
+            &[(
+                "META-INF/com/android/metadata",
+                "product_name=RMX3709TR\nversion_name=RMX3709_16.0.2.400(EX01)\n",
+            )],
+        );
+        assert_eq!(get_firmware_name(&meta), "RMX3709TR_16.0.2.400");
+
+        let props = zip_with(
+            dir.path(),
+            "b.zip",
+            &[("payload_properties.txt", "ota_target_version=RMX 14/ok\n")],
+        );
+        assert_eq!(get_firmware_name(&props), "RMX_14_ok");
+
+        // Nothing usable inside: the zip's own stem.
+        let plain = zip_with(dir.path(), "my-fw.zip", &[("readme.txt", "hi")]);
+        assert_eq!(get_firmware_name(&plain), "my-fw");
     }
 }
