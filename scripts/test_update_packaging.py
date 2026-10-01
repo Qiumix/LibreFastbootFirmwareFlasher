@@ -337,7 +337,7 @@ class TestMetainfo(Case):
 
 class TestCli(Case):
     def test_rejects_a_non_release_version(self):
-        for bad in ("main", "2.8", "2.8.0-rc1", ""):
+        for bad in ("main", "2.8", "2.8.0-rc1", "", "\u0662.\u0669.\u0660"):
             sys.argv = ["update-packaging.py", "--version", bad]
             self.assertEqual(up.main(), 2, bad)
 

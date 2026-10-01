@@ -143,13 +143,17 @@ jobs:
 
       - name: Package (macOS .app)
         if: contains(matrix.name, 'macos')
+        env:
+          # Through env, not ${{ }} in the script: a tag name may contain
+          # quotes and $, and would otherwise be spliced into the shell.
+          TAG: ${{ github.ref_name }}
         run: |
           brew install librsvg
           APP="LibreFastbootFirmwareFlasher.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" dist
           cp "target/${{ matrix.target }}/release/lfff-gui" "$APP/Contents/MacOS/lfff-gui"
           cp gui/macOS/Info.plist "$APP/Contents/Info.plist"
-          sed -i '' 's/\$(CARGO_PKG_VERSION)/${{ github.ref_name }}/' "$APP/Contents/Info.plist"
+          sed -i '' 's/\$(CARGO_PKG_VERSION)/'"$TAG"'/' "$APP/Contents/Info.plist"
           # Generate .icns from app icon
           mkdir -p AppIcon.iconset
           for size in 16 32 128 256 512; do
@@ -270,10 +274,25 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          base=https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous
-          curl -fsSLo linuxdeploy "$base/linuxdeploy-${ARCH}.AppImage"
+          # Pinned releases with checked hashes, not the moving "continuous"
+          # build: these tools run here and package what ships, so a swapped
+          # upstream binary would poison the published AppImage.
+          ld_tag=1-alpha-20251107-1
+          plugin_tag=1-alpha-20250213-1
+          case "$ARCH" in
+            x86_64)
+              ld_sha=c20cd71e3a4e3b80c3483cef793cda3f4e990aca14014d23c544ca3ce1270b4d
+              plugin_sha=992d502a248e14ab185448ddf6f6e7d25558cb84d4623c354c3af350c25fccb3 ;;
+            aarch64)
+              ld_sha=620095110d693282b8ebeb244a95b5e911cf8f65f76c88b4b47d16ae6346fcff
+              plugin_sha=83c292149274965a865dcd44c135cfca8ba28c6b7de3eb628d4b8b5f248af17c ;;
+          esac
+          curl -fsSLo linuxdeploy \
+            "https://github.com/linuxdeploy/linuxdeploy/releases/download/$ld_tag/linuxdeploy-${ARCH}.AppImage"
           curl -fsSLo linuxdeploy-plugin-appimage \
-            "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/continuous/linuxdeploy-plugin-appimage-${ARCH}.AppImage"
+            "https://github.com/linuxdeploy/linuxdeploy-plugin-appimage/releases/download/$plugin_tag/linuxdeploy-plugin-appimage-${ARCH}.AppImage"
+          printf '%s  %s\n' "$ld_sha" linuxdeploy "$plugin_sha" linuxdeploy-plugin-appimage \
+            | sha256sum -c -
           chmod +x linuxdeploy linuxdeploy-plugin-appimage
           export PATH="$PWD:$PATH"
           # linuxdeploy matches the icon to the desktop file's Icon= key.

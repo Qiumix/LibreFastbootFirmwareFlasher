@@ -212,7 +212,7 @@ def main() -> int:
     args = ap.parse_args()
 
     version = args.version.lstrip("v")
-    if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+    if not re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", version):
         print(f"not a release version: {args.version}", file=sys.stderr)
         return 2
 
