@@ -273,6 +273,14 @@ pub fn run(
         }
     }
 
+    let options = FlashOptions {
+        dry_run,
+        skip_xbl_abl,
+        skip_preloader,
+        as_mediatek: Some(as_mediatek),
+        skip_partitions: String::new(),
+    };
+
     if !dry_run {
         // -- Pre-flash device checks (device present, unlocked, battery, cable) --
         let check = lfff_lib::device::run_pre_flash_checks(serial);
@@ -295,6 +303,28 @@ pub fn run(
         if !as_mediatek && !source.is_source() && !arb_gate(dir) {
             println!("{}", "Aborted by user (ARB check).".yellow());
             return 1;
+        }
+
+        // -- What will be flashed: the same selection the session makes --
+        let (selected, held_back) =
+            lfff_lib::flasher::select_images(images.clone(), &options, source.is_source());
+        let mut names: Vec<&String> = selected.keys().collect();
+        names.sort();
+        println!(
+            "\n{}",
+            "── Partitions to flash ──────────────────────────────────".dimmed()
+        );
+        println!(
+            "  {} {}",
+            format!("{}:", names.len()).bold(),
+            names
+                .iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for (name, reason) in &held_back {
+            println!("  {}", format!("Skipping {} ({})", name, reason).yellow());
         }
 
         // -- Final confirmation --
@@ -346,13 +376,7 @@ pub fn run(
     let session = run_flash_session_with_log(
         source,
         serial,
-        &FlashOptions {
-            dry_run,
-            skip_xbl_abl,
-            skip_preloader,
-            as_mediatek: Some(as_mediatek),
-            skip_partitions: String::new(),
-        },
+        &options,
         cancel,
         &on_log,
         &on_progress,

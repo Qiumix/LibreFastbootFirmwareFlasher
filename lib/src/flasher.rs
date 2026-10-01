@@ -745,7 +745,10 @@ pub fn wipe_super_with_log(serial: Option<&str>, super_names: &[String], on_log:
 
 /// Scan firmware_dir for .img files.
 /// Strips _a/_b suffix so abl_a.img -> key "abl" (prevents abl_a_a bug).
-/// Shallower paths win on duplicates.
+/// On duplicates the shallower path wins, then the lexically smaller one —
+/// a fixed rule rather than directory order, because the ARB check reads
+/// xbl_config through this same function and must see the image that is
+/// actually flashed.
 pub fn collect_images(firmware_dir: &Path) -> HashMap<String, PathBuf> {
     let mut images: HashMap<String, PathBuf> = HashMap::new();
     let mut entries: Vec<PathBuf> = Vec::new();
@@ -764,7 +767,7 @@ pub fn collect_images(firmware_dir: &Path) -> HashMap<String, PathBuf> {
     }
 
     collect_recursive(firmware_dir, &mut entries);
-    entries.sort_by_key(|p| p.components().count());
+    entries.sort_by(|a, b| (a.components().count(), a).cmp(&(b.components().count(), b)));
 
     for img in entries {
         let mut stem = img
@@ -1116,6 +1119,82 @@ fn flash_batch_with_log(
     BatchOutcome::Done
 }
 
+/// Partitions that hold data unique to one device — calibration, IMEI and
+/// modem state, factory-reset protection, keys — or the user's own data.
+/// No firmware package ships them, and overwriting them cannot be undone, so
+/// a downloaded firmware that contains one is suspect and the image is left
+/// out. Flashing one on purpose remains possible with `flash-partition`.
+const NEVER_FROM_FIRMWARE: &[&str] = &[
+    "persist",
+    "persistbak",
+    "modemst1",
+    "modemst2",
+    "fsg",
+    "fsc",
+    "devinfo",
+    "frp",
+    "userdata",
+    "keystore",
+];
+
+/// True for names fastboot can only read as a partition name. Partition
+/// names come from file names in the firmware; one like `-w` or
+/// `--slot=all` would otherwise be read as an option.
+fn is_plain_partition_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+}
+
+fn skip_list(skip_partitions: &str) -> Vec<String> {
+    skip_partitions
+        .split(',')
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Split collected images into what a session will flash and what it leaves
+/// out, with the reason for each. Both the flash session and the CLI's
+/// confirmation call this, so the list the user approves is the list flashed.
+///
+/// `NEVER_FROM_FIRMWARE` applies only to downloaded firmware: a source build
+/// is the user's own output, and an AOSP build legitimately contains
+/// `userdata.img`.
+pub fn select_images(
+    images: HashMap<String, PathBuf>,
+    options: &FlashOptions,
+    is_source: bool,
+) -> (HashMap<String, PathBuf>, Vec<(String, String)>) {
+    let skips = skip_list(&options.skip_partitions);
+    let mut keep = HashMap::new();
+    let mut skipped = Vec::new();
+    for (name, path) in images {
+        let reason = if !is_plain_partition_name(&name) {
+            Some("not a plain partition name")
+        } else if !is_source && NEVER_FROM_FIRMWARE.contains(&name.as_str()) {
+            Some("device-unique data, never part of a firmware")
+        } else if options.skip_xbl_abl && is_xbl_abl(&name) {
+            Some("xbl/abl excluded")
+        } else if options.skip_preloader && is_preloader(&name) {
+            Some("preloader excluded")
+        } else if skips.contains(&name) {
+            Some("user excluded")
+        } else {
+            None
+        };
+        match reason {
+            Some(r) => skipped.push((name, r.to_string())),
+            None => {
+                keep.insert(name, path);
+            }
+        }
+    }
+    skipped.sort();
+    (keep, skipped)
+}
+
 pub fn run_flash_session_with_log(
     source: &FirmwareSource,
     serial: Option<&str>,
@@ -1125,12 +1204,12 @@ pub fn run_flash_session_with_log(
     on_progress: &dyn Fn(FlashProgress),
     on_failure: &dyn Fn(&str, &str, &str) -> FailureAction,
 ) -> FlashSession {
+    // skip_xbl_abl and skip_preloader are applied by select_images.
     let FlashOptions {
         dry_run,
-        skip_xbl_abl,
-        skip_preloader,
         as_mediatek,
         skip_partitions,
+        ..
     } = options.clone();
     let firmware_dir = source.path();
     let mut session = FlashSession::new(source, serial, dry_run);
@@ -1156,36 +1235,17 @@ pub fn run_flash_session_with_log(
 
     on_log(format!("{} images found", images.len()));
 
-    let skip_list: Vec<String> = skip_partitions
-        .split(',')
-        .map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty())
-        .collect();
-    if !skip_list.is_empty() {
+    if !skip_partitions.trim().is_empty() {
         on_log(format!(
             "User-specified partitions to skip: {}",
-            skip_list.join(", ")
+            skip_list(&skip_partitions).join(", ")
         ));
     }
 
-    // Filter skipped partitions
-    let filtered: HashMap<String, PathBuf> = images
-        .into_iter()
-        .filter(|(name, _)| {
-            if skip_xbl_abl && is_xbl_abl(name) {
-                on_log(format!("Skipping {} (xbl/abl excluded)", name));
-                false
-            } else if skip_preloader && is_preloader(name) {
-                on_log(format!("Skipping {} (preloader excluded)", name));
-                false
-            } else if skip_list.contains(&name.to_lowercase()) {
-                on_log(format!("Skipping {} (user excluded)", name));
-                false
-            } else {
-                true
-            }
-        })
-        .collect();
+    let (filtered, skipped) = select_images(images, options, source.is_source());
+    for (name, reason) in &skipped {
+        on_log(format!("Skipping {} ({})", name, reason));
+    }
 
     if filtered.is_empty() {
         on_log("No images to flash after filtering — aborting".into());
@@ -1628,5 +1688,100 @@ mod tests {
                 "{output:?}"
             );
         }
+    }
+
+    fn names(map: &HashMap<String, PathBuf>) -> Vec<&str> {
+        let mut v: Vec<&str> = map.keys().map(|s| s.as_str()).collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn firmware_cannot_overwrite_device_unique_partitions() {
+        let (keep, skipped) = select_images(
+            images(&[
+                "boot", "system", "persist", "modemst1", "fsg", "userdata", "frp",
+            ]),
+            &FlashOptions::default(),
+            false,
+        );
+        assert_eq!(names(&keep), ["boot", "system"]);
+        let held: Vec<&str> = skipped.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(held, ["frp", "fsg", "modemst1", "persist", "userdata"]);
+    }
+
+    #[test]
+    fn a_source_build_still_flashes_its_own_userdata() {
+        let (keep, _) = select_images(
+            images(&["boot", "system", "userdata"]),
+            &FlashOptions::default(),
+            true,
+        );
+        assert_eq!(names(&keep), ["boot", "system", "userdata"]);
+    }
+
+    #[test]
+    fn names_fastboot_could_read_as_options_are_refused() {
+        let (keep, skipped) = select_images(
+            images(&["boot", "-w", "--slot=all", "--set-active=b", "a b", "ok_2"]),
+            &FlashOptions::default(),
+            true, // refused even for the user's own build
+        );
+        assert_eq!(names(&keep), ["boot", "ok_2"]);
+        assert_eq!(skipped.len(), 4);
+        assert!(
+            skipped
+                .iter()
+                .all(|(_, r)| r == "not a plain partition name")
+        );
+    }
+
+    #[test]
+    fn existing_skip_options_keep_their_wording() {
+        let opts = FlashOptions {
+            skip_xbl_abl: true,
+            skip_preloader: true,
+            skip_partitions: " Vendor_Boot , ".into(),
+            ..FlashOptions::default()
+        };
+        let (keep, skipped) = select_images(
+            images(&["boot", "xbl", "abl", "preloader", "vendor_boot"]),
+            &opts,
+            false,
+        );
+        assert_eq!(names(&keep), ["boot"]);
+        assert_eq!(
+            skipped,
+            [
+                ("abl".to_string(), "xbl/abl excluded".to_string()),
+                ("preloader".to_string(), "preloader excluded".to_string()),
+                ("vendor_boot".to_string(), "user excluded".to_string()),
+                ("xbl".to_string(), "xbl/abl excluded".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn duplicate_images_resolve_the_same_way_every_time() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for f in [
+            "xbl_config_b.img",
+            "XBL_CONFIG.img",
+            "xbl_config_a.img",
+            "deep/xbl_config.img",
+        ] {
+            let p = dir.path().join(f);
+            fs::create_dir_all(p.parent().expect("parent")).expect("mkdir");
+            fs::write(&p, b"x").expect("write");
+        }
+        let pick = collect_images(dir.path())
+            .remove("xbl_config")
+            .expect("xbl_config");
+        // Shallowest first, then the lexically smallest: "XBL_CONFIG.img"
+        // sorts before the lowercase names.
+        assert_eq!(
+            pick.file_name().and_then(|n| n.to_str()),
+            Some("XBL_CONFIG.img")
+        );
     }
 }

@@ -231,10 +231,14 @@ pub enum ArbVerdict {
 }
 
 /// Decide the ARB of the firmware extracted into `dir`.
+///
+/// Reads the xbl_config that flashing will use — picked by the same
+/// `collect_images` — so a folder with several (`xbl_config_a.img` and
+/// `XBL_CONFIG.img`, say) cannot show the ARB of one and flash the other.
 pub fn firmware_arb(dir: &Path) -> ArbVerdict {
-    match find_xbl_config(dir) {
+    match crate::flasher::collect_images(dir).get("xbl_config") {
         None => ArbVerdict::NotFound,
-        Some(xbl) => match extract_arb_from_xbl(&xbl).version {
+        Some(xbl) => match extract_arb_from_xbl_config(xbl).version {
             Some(v) => ArbVerdict::Known(v),
             None => ArbVerdict::Unparsed,
         },
@@ -479,6 +483,30 @@ mod tests {
             firmware_arb(dir(Some(b"not an elf")).path()),
             ArbVerdict::Unparsed
         );
+    }
+
+    #[test]
+    fn the_warning_reads_the_xbl_config_that_gets_flashed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let zero = elf_with(&hash_segment(&Synth {
+            arb: 0,
+            ..Synth::default()
+        }));
+        let three = elf_with(&hash_segment(&Synth::default()));
+        // The old lookup preferred xbl_config_a.img by name; flashing picks
+        // by collect_images's rule. Both must now land on the same file.
+        std::fs::write(dir.path().join("xbl_config_a.img"), &zero).expect("write");
+        std::fs::write(dir.path().join("XBL_CONFIG.img"), &three).expect("write");
+
+        let flashed = crate::flasher::collect_images(dir.path())
+            .remove("xbl_config")
+            .expect("xbl_config");
+        let shown = firmware_arb(dir.path());
+        assert_eq!(
+            ArbVerdict::Known(extract_arb_from_xbl_config(&flashed).version.expect("arb")),
+            shown
+        );
+        assert_eq!(shown, ArbVerdict::Known(3));
     }
 
     #[test]
