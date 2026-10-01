@@ -285,6 +285,43 @@ fn needs_sudo(pm: &str) -> bool {
 
 const PDG_REPO: &str = "rhythmcache/payload-dumper-rust";
 
+/// The payload-dumper-rust release LFFF installs, pinned rather than "latest":
+/// the binary is run straight away and copied into /usr/local/bin with sudo,
+/// so a compromised upstream release must not become code running on every
+/// machine that clicks "install dependencies".
+///
+/// Kept identical to `payloadDumperVersion` and its hashes in flake.nix — the
+/// same zip files — and a test fails if the two drift apart.
+const PDG_VERSION: &str = "0.8.4";
+
+/// `(os, arch, asset, sha256)` for each platform with a prebuilt binary.
+const PDG_ASSETS: &[(&str, &str, &str, &str)] = &[
+    (
+        "linux",
+        "x86_64",
+        "payload_dumper-linux-x86_64.zip",
+        "d2a7cf4d8ef4daa73ebd34e0c6f77eb6c116a1745a1b31ad897e9ce2b2f54151",
+    ),
+    (
+        "linux",
+        "aarch64",
+        "payload_dumper-linux-aarch64.zip",
+        "fb95a825910601f0d07c72f1b614bf736774e64e61e6fea7da98e4dec5bba238",
+    ),
+    (
+        "macos",
+        "x86_64",
+        "payload_dumper-macos-x86_64.zip",
+        "08115533d79420e2a82ff6bbc5e3f02680358cd7cc7722c1f45eeeac48d81adb",
+    ),
+    (
+        "macos",
+        "aarch64",
+        "payload_dumper-macos-aarch64.zip",
+        "b0cf521edd8ab43b0d32e4b2ab70b2635abc559e4055045b35db7632611a1222",
+    ),
+];
+
 /// Escape hatch for distros that ship a foreign `payload_dumper`: point this at
 /// the payload-dumper-rust binary and every lookup below honours it.
 pub const PDG_ENV_OVERRIDE: &str = "LFFF_PAYLOAD_DUMPER";
@@ -429,23 +466,13 @@ fn set_exec(p: &Path) {
 #[cfg(not(unix))]
 fn set_exec(_p: &Path) {}
 
-/// Pick the correct asset name for the current platform.
-///
-/// Asset naming: `payload_dumper-{os}-{arch}.zip`
-/// Examples: payload_dumper-linux-x86_64.zip, payload_dumper-macos-aarch64.zip
-fn pdg_asset_name() -> Option<String> {
-    let os = match std::env::consts::OS {
-        "linux" => "linux",
-        "macos" => "macos",
-        _ => return None,
-    };
-    let arch = match std::env::consts::ARCH {
-        "x86_64" => "x86_64",
-        "aarch64" => "aarch64",
-        "arm" => "armv7",
-        _ => return None,
-    };
-    Some(format!("payload_dumper-{}-{}.zip", os, arch))
+/// The release asset and its expected sha256 for this platform, or `None`
+/// where there is no pinned prebuilt binary.
+fn pdg_asset() -> Option<(&'static str, &'static str)> {
+    PDG_ASSETS
+        .iter()
+        .find(|(os, arch, _, _)| *os == std::env::consts::OS && *arch == std::env::consts::ARCH)
+        .map(|&(_, _, asset, sha)| (asset, sha))
 }
 
 /// Install payload_dumper from GitHub releases.
@@ -463,8 +490,8 @@ fn install_payload_dumper(on_log: &dyn Fn(String)) -> DepResult {
         return result;
     }
 
-    let asset_name = match pdg_asset_name() {
-        Some(n) => n,
+    let (asset_name, expected_sha256) = match pdg_asset() {
+        Some(a) => a,
         None => {
             result.error = format!(
                 "No prebuilt binary for {}/{}. Install manually: cargo install payload_dumper",
@@ -475,46 +502,9 @@ fn install_payload_dumper(on_log: &dyn Fn(String)) -> DepResult {
         }
     };
 
-    // Fetch latest release tag from GitHub API
-    on_log("  Fetching latest payload_dumper release from GitHub ...".into());
-    let api_result = Command::new("curl")
-        .args([
-            "-sfL",
-            &format!("https://api.github.com/repos/{}/releases/latest", PDG_REPO),
-            "-H",
-            "User-Agent: lfff/0.2",
-        ])
-        .output();
-
-    let tag = match api_result {
-        Ok(output) if output.status.success() => {
-            let json = String::from_utf8_lossy(&output.stdout);
-            // JSON line:   "tag_name": "payload-dumper-rust-v0.8.2",
-            // Find the value between the last pair of quotes on the line
-            json.lines()
-                .find(|l| l.contains("\"tag_name\""))
-                .and_then(|l| {
-                    // Skip past "tag_name" key — find value after the colon
-                    let after_key = l.split("\"tag_name\"").nth(1)?;
-                    // Now extract string between quotes: : "value",
-                    let first_quote = after_key.find('"')? + 1;
-                    let rest = &after_key[first_quote..];
-                    let end_quote = rest.find('"')?;
-                    let val = &rest[..end_quote];
-                    if val.is_empty() {
-                        None
-                    } else {
-                        Some(val.to_string())
-                    }
-                })
-                .unwrap_or_else(|| "payload-dumper-rust-v0.8.2".to_string())
-        }
-        _ => "payload-dumper-rust-v0.8.2".to_string(),
-    };
-
     let dl_url = format!(
-        "https://github.com/{}/releases/download/{}/{}",
-        PDG_REPO, tag, asset_name
+        "https://github.com/{}/releases/download/payload-dumper-rust-v{}/{}",
+        PDG_REPO, PDG_VERSION, asset_name
     );
 
     on_log(format!("  Downloading {} ...", asset_name));
@@ -528,7 +518,7 @@ fn install_payload_dumper(on_log: &dyn Fn(String)) -> DepResult {
             return result;
         }
     };
-    let archive = tmp_dir.path().join(&asset_name);
+    let archive = tmp_dir.path().join(asset_name);
 
     // Download (-f: fail on HTTP errors instead of saving an error page)
     let dl_ok = Command::new("curl")
@@ -542,6 +532,22 @@ fn install_payload_dumper(on_log: &dyn Fn(String)) -> DepResult {
     if !dl_ok {
         result.error = format!("Download failed: {}", dl_url);
         return result;
+    }
+
+    // Verified before anything is unpacked, let alone run or installed.
+    match crate::utils::verify_sha256(&archive, expected_sha256) {
+        Ok(true) => on_log("  Checksum verified".into()),
+        Ok(false) => {
+            result.error = format!(
+                "Checksum mismatch for {} — refusing to install it",
+                asset_name
+            );
+            return result;
+        }
+        Err(e) => {
+            result.error = format!("Cannot verify {}: {}", asset_name, e);
+            return result;
+        }
     }
 
     // Extract with the zip crate — no external unzip dependency.
@@ -966,5 +972,58 @@ mod tests {
     #[test]
     fn rejects_unrelated_binary() {
         assert!(!version_banner_is_rust(true, b"GNU coreutils 9.5\n"));
+    }
+
+    /// Standard base64, for comparing against the SRI hashes in flake.nix.
+    fn base64(bytes: &[u8]) -> String {
+        const T: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut out = String::new();
+        for c in bytes.chunks(3) {
+            let n = (u32::from(c[0]) << 16)
+                | (u32::from(*c.get(1).unwrap_or(&0)) << 8)
+                | u32::from(*c.get(2).unwrap_or(&0));
+            for i in 0..4 {
+                if i <= c.len() {
+                    out.push(T[(n >> (18 - 6 * i) & 63) as usize] as char);
+                } else {
+                    out.push('=');
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn payload_dumper_pin_matches_flake_nix() {
+        let flake =
+            std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../flake.nix"))
+                .expect("read flake.nix");
+        assert!(
+            flake.contains(&format!("payloadDumperVersion = \"{PDG_VERSION}\";")),
+            "flake.nix pins a different payload-dumper-rust than PDG_VERSION"
+        );
+        for (os, arch, _, sha) in PDG_ASSETS {
+            let bytes: Vec<u8> = (0..sha.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&sha[i..i + 2], 16).expect("hex"))
+                .collect();
+            let line = format!("{os}-{arch} = \"sha256-{}\";", base64(&bytes));
+            assert!(
+                flake.contains(&line),
+                "flake.nix has a different hash for {os}-{arch}; expected `{line}`"
+            );
+        }
+    }
+
+    #[test]
+    fn every_pinned_hash_is_a_sha256() {
+        for (_, _, asset, sha) in PDG_ASSETS {
+            assert_eq!(sha.len(), 64, "{asset}");
+            assert!(
+                sha.bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+                "{asset}"
+            );
+        }
     }
 }
