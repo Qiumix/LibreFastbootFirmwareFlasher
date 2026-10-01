@@ -103,9 +103,27 @@ fn extract_real_url(url: &str) -> String {
     url.to_string()
 }
 
+/// Accept only an absolute `http`/`https` URL.
+///
+/// Every URL handed to curl or aria2c passes through here first: the pasted
+/// one, the target of a 4PDA redirect, and the `Location` a server answers
+/// with. All three are someone else's text, and as a bare argument a value
+/// like `--enable-rpc=true` would be read as an option — aria2c would start an
+/// unauthenticated RPC server that any local process or web page can use to
+/// write files. A parsed http(s) URL always begins with its scheme, so it can
+/// only ever be read as a URL.
+fn web_url(raw: &str) -> Result<url::Url, String> {
+    let shown = &raw[..raw.len().min(100)];
+    let parsed = url::Url::parse(raw.trim()).map_err(|_| format!("Not a valid URL: {shown}"))?;
+    match parsed.scheme() {
+        "http" | "https" if parsed.has_host() => Ok(parsed),
+        _ => Err(format!("Only http(s) links can be downloaded: {shown}")),
+    }
+}
+
 /// Follow OTA server 302 redirect to get CDN URL.
 /// If no redirect found, assume URL is already a direct download link.
-fn resolve_cdn(url: &str) -> Option<String> {
+fn resolve_cdn(url: &url::Url) -> Result<url::Url, String> {
     let mut parts: Vec<String> = vec![
         "curl".into(),
         "-s".into(),
@@ -122,21 +140,38 @@ fn resolve_cdn(url: &str) -> Option<String> {
         parts.push("-H".into());
         parts.push(h.to_string());
     }
-    parts.push(url.into());
+    parts.push(url.as_str().into());
     let refs: Vec<&str> = parts.iter().map(|s| s.as_str()).collect();
     let r = run_cmd(&refs, 30);
-    for line in r.stdout.lines() {
-        if line.to_lowercase().starts_with("location:") {
-            let cdn = line.split_once(':').map(|(_, v)| v.trim().to_string())?;
+    match location_header(&r.stdout) {
+        Some(loc) => {
+            // A relative Location is resolved against the URL that sent it.
+            let cdn = url
+                .join(loc)
+                .map_err(|_| format!("Server redirected to an invalid URL: {loc}"))?;
+            let cdn = web_url(cdn.as_str())?;
             info!("CDN URL resolved: {}", cdn);
-            return Some(cdn);
+            Ok(cdn)
+        }
+        None => {
+            info!(
+                "No redirect found, using URL directly: {}",
+                &url.as_str()[..url.as_str().len().min(100)]
+            );
+            Ok(url.clone())
         }
     }
-    info!(
-        "No redirect found, using URL directly: {}",
-        &url[..url.len().min(100)]
-    );
-    Some(url.to_string())
+}
+
+/// The `Location` value from a block of response headers, if any.
+fn location_header(headers: &str) -> Option<&str> {
+    headers.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("location")
+            .then(|| value.trim())
+            .filter(|v| !v.is_empty())
+    })
 }
 
 /// Parse `?e=<unix_ts>` expiry from a CDN URL.
@@ -327,16 +362,20 @@ where
     }
 
     let real_url = extract_real_url(url);
-    info!("OTA endpoint: {}", real_url);
+    let endpoint = match web_url(&real_url) {
+        Ok(u) => u,
+        Err(e) => return DownloadResult::fail(url, &e),
+    };
+    info!("OTA endpoint: {}", endpoint);
 
     on_progress(DownloadProgress {
         raw_line: "Resolving CDN link...".into(),
         ..Default::default()
     });
 
-    let cdn_url = match resolve_cdn(&real_url) {
-        Some(c) => c,
-        None => return DownloadResult::fail(&real_url, "Failed to resolve CDN URL"),
+    let cdn_url = match resolve_cdn(&endpoint) {
+        Ok(c) => c.to_string(),
+        Err(e) => return DownloadResult::fail(&real_url, &e),
     };
     info!("CDN URL: {}", cdn_url);
 
@@ -501,7 +540,11 @@ fn build_aria2c_cmd(cdn_url: &str, output_dir: Option<&Path>, connections: u32) 
         .arg("--human-readable=true")
         .arg("--console-log-level=notice") // print [NOTICE] lines to stderr
         .arg("--show-console-readout=true") // force progress lines even when not a TTY
-        .arg("--download-result=default");
+        .arg("--download-result=default")
+        // A server must not be able to turn a firmware download into a
+        // BitTorrent or Metalink session by answering with a .torrent file.
+        .arg("--follow-torrent=false")
+        .arg("--follow-metalink=false");
 
     if let Some(dir) = output_dir {
         std::fs::create_dir_all(dir).ok();
@@ -546,6 +589,70 @@ mod tests {
             extract_real_url("https://example.com/fw.zip"),
             "https://example.com/fw.zip"
         );
+    }
+
+    #[test]
+    fn only_absolute_http_urls_get_through() {
+        for ok in [
+            "https://example.com/fw.zip",
+            "http://ota.example.com/a?b=c",
+            "  https://example.com/x  ",
+        ] {
+            let u = web_url(ok).unwrap_or_else(|e| panic!("{ok}: {e}"));
+            assert!(u.as_str().starts_with("http"), "{ok}");
+        }
+        for bad in [
+            "--enable-rpc=true",
+            "-i/tmp/list",
+            "--conf-path=/tmp/x",
+            "file:///etc/passwd",
+            "magnet:?xt=urn:btih:abc",
+            "ftp://example.com/fw.zip",
+            "javascript:alert(1)",
+            "/tmp/local.torrent",
+            "https://",
+            "",
+        ] {
+            assert!(web_url(bad).is_err(), "{bad:?} must be rejected");
+        }
+    }
+
+    #[test]
+    fn a_4pda_link_cannot_smuggle_an_option() {
+        // Decodes to `--enable-rpc=true`: an aria2c option, not a URL.
+        let unwrapped = extract_real_url("https://4pda.to/goto/?u=--enable-rpc%3Dtrue");
+        assert_eq!(unwrapped, "--enable-rpc=true");
+        assert!(web_url(&unwrapped).is_err());
+    }
+
+    #[test]
+    fn location_header_is_found_case_insensitively() {
+        let h = "HTTP/1.1 302 Found\r\nServer: x\r\nLOCATION: https://cdn.example.com/fw.zip\r\n";
+        assert_eq!(location_header(h), Some("https://cdn.example.com/fw.zip"));
+        assert_eq!(
+            location_header("HTTP/1.1 200 OK\r\nContent-Length: 1\r\n"),
+            None
+        );
+        assert_eq!(location_header("Location:   \r\n"), None);
+    }
+
+    #[test]
+    fn a_redirect_target_must_also_be_http() {
+        let base = web_url("https://ota.example.com/get/fw").expect("base");
+        // Relative targets resolve against the sender and stay on http(s).
+        let rel = base.join("/cdn/fw.zip").expect("join");
+        assert_eq!(
+            web_url(rel.as_str()).expect("relative").as_str(),
+            "https://ota.example.com/cdn/fw.zip"
+        );
+        for loc in ["file:///etc/passwd", "magnet:?xt=urn:btih:abc", "ftp://x/y"] {
+            let joined = base.join(loc).expect("join");
+            assert!(web_url(joined.as_str()).is_err(), "{loc}");
+        }
+        // `--x` as a Location is just a relative path, so it can never come
+        // out as an option.
+        let dash = base.join("--enable-rpc=true").expect("join");
+        assert!(dash.as_str().starts_with("https://"));
     }
 
     #[test]
