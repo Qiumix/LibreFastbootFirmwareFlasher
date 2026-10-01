@@ -871,6 +871,12 @@ pub fn register_callbacks(
         if let Some(ui) = w.upgrade() {
             let url = ui.get_update_url().to_string();
             ui.set_show_update_dialog(false);
+            // The URL comes from a network response; xdg-open and open will
+            // launch whatever handler a scheme maps to, so only the project's
+            // own GitHub pages are opened.
+            if !url.starts_with("https://github.com/mrFrok/LibreFastbootFirmwareFlasher/") {
+                return;
+            }
             std::thread::spawn(move || {
                 #[cfg(target_os = "linux")]
                 {

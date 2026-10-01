@@ -78,6 +78,40 @@ is_musl() {
     [ -e "/lib/ld-musl-$(uname -m).so.1" ] || ldd --version 2>&1 | grep -qi musl
 }
 
+# Download $1 to file $2, with whichever of curl or wget is present.
+fetch() {
+    if command -v curl &>/dev/null; then
+        curl -fsSL "$1" -o "$2"
+    else
+        wget -qO "$2" "$1"
+    fi
+}
+
+# sha256 of a file: sha256sum on Linux and Termux, shasum on macOS.
+sha256_of() {
+    if command -v sha256sum &>/dev/null; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum &>/dev/null; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    fi
+}
+
+# Check a downloaded asset against the .sha256 file the release publishes
+# beside it. Only the digest is compared, not the file name inside.
+verify_asset() {
+    local file="$1" sidecar="$2"
+    local expected actual
+    expected="$(cut -d' ' -f1 < "$sidecar" | tr 'A-F' 'a-f')"
+    case "$expected" in
+        *[!0-9a-f]* | "") err "The checksum file for $(basename "$file") is malformed" ;;
+    esac
+    [ "${#expected}" -eq 64 ] || err "The checksum file for $(basename "$file") is malformed"
+    actual="$(sha256_of "$file")"
+    [ -n "$actual" ] || err "Need sha256sum or shasum to verify the download"
+    [ "$actual" = "$expected" ] || err "Checksum mismatch for $(basename "$file") — not installing it"
+    ok "Checksum verified"
+}
+
 find_install_dir() {
     if [ -w /usr/local/bin ]; then
         echo "/usr/local/bin"
@@ -151,12 +185,10 @@ install_binary() {
     trap 'rm -rf "$tmp"; trap - RETURN' RETURN
 
     info "Downloading $asset_name..."
-    if command -v curl &>/dev/null; then
-        curl -fsSL "$url" -o "$tmp/$asset_name" || err "Could not download $url"
-    else
-        wget -qO "$tmp/$asset_name" "$url" || err "Could not download $url"
-    fi
+    fetch "$url" "$tmp/$asset_name" || err "Could not download $url"
+    fetch "$url.sha256" "$tmp/$asset_name.sha256" || err "Could not download $url.sha256"
     ok "Downloaded"
+    verify_asset "$tmp/$asset_name" "$tmp/$asset_name.sha256"
 
     tar xzf "$tmp/$asset_name" -C "$tmp"
 
