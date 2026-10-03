@@ -48,10 +48,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: cli-${{ matrix.target }}
 
       - name: Build CLI
         run: cargo build --release --target ${{ matrix.target }} -p lfff-cli
@@ -119,10 +115,6 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
-      - name: Rust Cache
-        uses: Swatinem/rust-cache@v2
-        with:
-          key: gui-${{ matrix.target }}
 
       - name: Install Linux system dependencies
         if: contains(matrix.os, 'ubuntu')
@@ -210,6 +202,18 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      # Built on main by musl-gui-cache.yml; a tag run cannot save a cache
+      # the next tag could read, so this only restores. Same key and paths.
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            target/musl
+            target/musl-cargo/registry/index
+            target/musl-cargo/registry/cache
+            target/musl-cargo/git/db
+          key: musl-gui-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'scripts/build-gui-musl.sh') }}
+          restore-keys: musl-gui-${{ matrix.arch }}-
 
       - name: Build GUI in Alpine
         run: |

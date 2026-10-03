@@ -1,0 +1,50 @@
+name: Warm the musl GUI cache
+
+# The musl GUI compiles skia from source (rust-skia publishes no prebuilt
+# musl skia), which takes the better part of an hour per architecture. A cache
+# fixes that, but Actions caches are scoped to the ref that saved them: a
+# release run on tag vX can only read caches from vX itself or from the
+# default branch. So the cache is built here, on main, and release.yml only
+# restores it.
+#
+# Runs when the dependencies or the build script change — the only times the
+# cached skia goes stale — and on demand.
+on:
+  push:
+    branches: [main]
+    paths:
+      - Cargo.lock
+      - scripts/build-gui-musl.sh
+      - .github/workflows/musl-gui-cache.yml
+  workflow_dispatch:
+
+jobs:
+  warm:
+    name: musl GUI cache — ${{ matrix.arch }}
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            os: ubuntu-latest
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same key and paths as the restore step in release.yml — keep in sync.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            target/musl
+            target/musl-cargo/registry/index
+            target/musl-cargo/registry/cache
+            target/musl-cargo/git/db
+          key: musl-gui-${{ matrix.arch }}-${{ hashFiles('Cargo.lock', 'scripts/build-gui-musl.sh') }}
+          restore-keys: musl-gui-${{ matrix.arch }}-
+
+      - name: Build GUI in Alpine
+        run: |
+          docker run --rm -v "$PWD":/src -w /src rust:alpine \
+            scripts/build-gui-musl.sh "$(id -u):$(id -g)"
