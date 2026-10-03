@@ -92,11 +92,15 @@ jobs:
     strategy:
       matrix:
         include:
+          # The oldest supported Ubuntu LTS, not the newest: a binary needs
+          # at least the glibc it was built against, so building on 24.04
+          # (glibc 2.39) shut out Debian 12, Ubuntu 22.04 and the like. Same
+          # rule the AppImage catalog checks for.
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+            os: ubuntu-22.04
             name: linux-x86_64
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
             name: linux-aarch64
           - target: x86_64-apple-darwin
             os: macos-latest
@@ -235,9 +239,9 @@ jobs:
       matrix:
         include:
           - arch: x86_64
-            os: ubuntu-latest
+            os: ubuntu-22.04
           - arch: aarch64
-            os: ubuntu-24.04-arm
+            os: ubuntu-22.04-arm
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -272,6 +276,7 @@ jobs:
           # No FUSE on the runners, so the tools unpack themselves instead.
           APPIMAGE_EXTRACT_AND_RUN: '1'
           ARCH: ${{ matrix.arch }}
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           # Pinned releases with checked hashes, not the moving "continuous"
@@ -303,15 +308,18 @@ jobs:
             --icon-file lfff-gui.svg \
             --output appimage
           mkdir -p dist
-          mv ./*.AppImage "dist/lfff-gui-linux-${ARCH}.AppImage"
+          # Named the way the AppImage catalog expects: no "linux" (every
+          # AppImage is), and the version in the name.
+          name="LibreFastbootFirmwareFlasher-${TAG#v}-${ARCH}.AppImage"
+          mv ./*.AppImage "dist/$name"
           cd dist
-          sha256sum "lfff-gui-linux-${ARCH}.AppImage" > "lfff-gui-linux-${ARCH}.AppImage.sha256"
+          sha256sum "$name" > "$name.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: appimage-${{ matrix.arch }}
-          path: dist/lfff-gui-linux-${{ matrix.arch }}.AppImage*
+          path: dist/LibreFastbootFirmwareFlasher-*-${{ matrix.arch }}.AppImage*
 
   release:
     needs: [build-cli, build-gui, build-gui-musl, package-appimage]

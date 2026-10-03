@@ -76,7 +76,8 @@ It still needs the usual udev rules on the host for the device to show up.
 
 **AppImage (Linux)**
 ```bash
-chmod +x lfff-gui-linux-x86_64.AppImage && ./lfff-gui-linux-x86_64.AppImage
+chmod +x LibreFastbootFirmwareFlasher-*-x86_64.AppImage
+./LibreFastbootFirmwareFlasher-*-x86_64.AppImage
 ```
 
 Ships the GUI and the CLI; external tools come from the host, via `lfff deps`.
